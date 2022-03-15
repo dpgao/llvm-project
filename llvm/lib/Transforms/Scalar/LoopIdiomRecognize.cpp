@@ -230,7 +230,8 @@ private:
                                   Instruction *TheLoad,
                                   const SCEVAddRecExpr *StoreEv,
                                   const SCEVAddRecExpr *LoadEv,
-                                  const SCEV *BECount);
+                                  const SCEV *BECount,
+                                  PreserveCheriTags PreserveTags);
   bool avoidLIRForMultiBlockLoop(bool IsMemset = false,
                                  bool IsLoopMemset = false);
 
@@ -889,7 +890,8 @@ bool LoopIdiomRecognize::processLoopMemCpy(MemCpyInst *MCI,
 
   return processLoopStoreOfLoopLoad(Dest, Source, (unsigned)SizeInBytes,
                                     MCI->getDestAlign(), MCI->getSourceAlign(),
-                                    MCI, MCI, StoreEv, LoadEv, BECount);
+                                    MCI, MCI, StoreEv, LoadEv, BECount,
+                                    MCI->shouldPreserveCheriTags());
 }
 
 /// processLoopMemSet - See if this memset can be promoted to a large memset.
@@ -1170,8 +1172,17 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(StoreInst *SI,
 
   Value *StorePtr = SI->getPointerOperand();
   const SCEVAddRecExpr *StoreEv = cast<SCEVAddRecExpr>(SE->getSCEV(StorePtr));
-  unsigned StoreSize = DL->getTypeStoreSize(SI->getValueOperand()->getType());
-
+  Type *StoreType = SI->getValueOperand()->getType();
+  unsigned StoreSize = DL->getTypeStoreSize(StoreType);
+  auto PreserveTags = PreserveCheriTags::Unknown;
+  if (DL->isFatPointer(StoreType->getScalarType())) {
+    // Capabilities and vectors of capabilities need to preserve tags
+    PreserveTags = PreserveCheriTags::Required;
+  } else if (StoreType->isSingleValueType()) {
+    // But all stores of simple types (i.e. non-struct, non-array) never copy
+    // CHERI tag bits, so we can mark the memcpy as non-tag-preserving.
+    PreserveTags = PreserveCheriTags::Unnecessary;
+  }
   // The store must be feeding a non-volatile load.
   LoadInst *LI = cast<LoadInst>(SI->getValueOperand());
   assert(LI->isUnordered() && "Expected only non-volatile non-ordered loads.");
@@ -1183,14 +1194,14 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(StoreInst *SI,
   const SCEVAddRecExpr *LoadEv = cast<SCEVAddRecExpr>(SE->getSCEV(LoadPtr));
   return processLoopStoreOfLoopLoad(StorePtr, LoadPtr, StoreSize,
                                     SI->getAlign(), LI->getAlign(), SI, LI,
-                                    StoreEv, LoadEv, BECount);
+                                    StoreEv, LoadEv, BECount, PreserveTags);
 }
 
 bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(
     Value *DestPtr, Value *SourcePtr, unsigned StoreSize, MaybeAlign StoreAlign,
     MaybeAlign LoadAlign, Instruction *TheStore, Instruction *TheLoad,
     const SCEVAddRecExpr *StoreEv, const SCEVAddRecExpr *LoadEv,
-    const SCEV *BECount) {
+    const SCEV *BECount, PreserveCheriTags PreserveTags) {
 
   // FIXME: until llvm.memcpy.inline supports dynamic sizes, we need to
   // conservatively bail here, since otherwise we may have to transform
@@ -1325,10 +1336,10 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(
   if (!TheStore->isAtomic() && !TheLoad->isAtomic()) {
     if (UseMemMove)
       NewCall = Builder.CreateMemMove(StoreBasePtr, StoreAlign, LoadBasePtr,
-                                      LoadAlign, NumBytes);
+                                      LoadAlign, NumBytes, PreserveTags);
     else
       NewCall = Builder.CreateMemCpy(StoreBasePtr, StoreAlign, LoadBasePtr,
-                                     LoadAlign, NumBytes);
+                                     LoadAlign, NumBytes, PreserveTags);
   } else {
     // For now don't support unordered atomic memmove.
     if (UseMemMove)
@@ -1352,7 +1363,7 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(
     // have an alignment but non-atomic loads/stores may not.
     NewCall = Builder.CreateElementUnorderedAtomicMemCpy(
         StoreBasePtr, StoreAlign.getValue(), LoadBasePtr, LoadAlign.getValue(),
-        NumBytes, StoreSize);
+        NumBytes, StoreSize, PreserveTags);
   }
   NewCall->setDebugLoc(TheStore->getDebugLoc());
 
